@@ -1,11 +1,12 @@
 use crate::config::Config;
-use crate::layout::{self, Layout, Rect};
+use crate::layout::{self, Layout, Rect, WindowState};
 use std::collections::HashMap;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const IGNORE_CLASSES: &[&str] = &[
@@ -21,15 +22,25 @@ const IGNORE_CLASSES: &[&str] = &[
 
 pub struct WindowManager {
     config: Config,
-    workspaces: HashMap<u32, Vec<HWND>>,
+    workspaces: HashMap<u32, Vec<WindowState>>,
     current_workspace: u32,
     layout: Layout,
     tiling_enabled: bool,
     focused: Option<HWND>,
 }
 
+static mut GLOBAL_WM: Option<*mut WindowManager> = None;
+
 impl WindowManager {
     pub fn new(config: Config) -> Self {
+        let mut config = config;
+        if config.workspace.count == 0 {
+            config.workspace.count = 1;
+        }
+        if config.workspace.count > 9 {
+            config.workspace.count = 9;
+        }
+
         let count = config.workspace.count;
         let mut workspaces = HashMap::new();
         for i in 1..=count {
@@ -42,6 +53,12 @@ impl WindowManager {
             layout: Layout::MasterStack,
             tiling_enabled: true,
             focused: None,
+        }
+    }
+
+    pub fn set_global(wm: &mut Self) {
+        unsafe {
+            GLOBAL_WM = Some(wm as *mut WindowManager);
         }
     }
 
@@ -84,6 +101,16 @@ impl WindowManager {
             self.collect_windows();
             self.tile_all();
 
+            SetWinEventHook(
+                EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_DESTROY,
+                None,
+                Some(win_event_callback),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+
             let mut msg = MSG::default();
             loop {
                 let result = GetMessageW(&mut msg, None, 0, 0);
@@ -120,21 +147,14 @@ impl WindowManager {
                 "l" => 0x4C,
                 "f" => 0x46,
                 "h" => 0x48,
-                "1" => VK_1.0 as u32,
-                "2" => VK_2.0 as u32,
-                "3" => VK_3.0 as u32,
-                "4" => VK_4.0 as u32,
-                "5" => VK_5.0 as u32,
-                "6" => VK_6.0 as u32,
-                "7" => VK_7.0 as u32,
-                "8" => VK_8.0 as u32,
-                "9" => VK_9.0 as u32,
                 _ => 0,
             }
         };
 
         let kb = &self.config.keybinds;
         let modif = mod_to_val(&kb.modifier);
+
+        let mut used_vkeys: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         let binds: Vec<(&str, u32)> = vec![
             (&kb.tile_toggle, 1),
@@ -148,13 +168,18 @@ impl WindowManager {
 
         for (key, id) in binds {
             let vk = key_to_val(key);
-            if vk != 0 {
+            if vk != 0 && !used_vkeys.contains(&vk) {
                 let _ = RegisterHotKey(hwnd, id as i32, modif, vk);
+                used_vkeys.insert(vk);
             }
         }
 
         for ws in 1..=self.config.workspace.count {
-            let _ = RegisterHotKey(hwnd, 100 + ws as i32, modif, VK_1.0 as u32 + ws - 1);
+            let vk = VK_1.0 as u32 + ws - 1;
+            if !used_vkeys.contains(&vk) {
+                let _ = RegisterHotKey(hwnd, 100 + ws as i32, modif, vk);
+                used_vkeys.insert(vk);
+            }
         }
     }
 
@@ -222,25 +247,67 @@ impl WindowManager {
         let ws = self.workspaces.get_mut(&self.current_workspace).unwrap();
         ws.clear();
 
-        let ptr = ws as *mut Vec<HWND>;
-        let _ = EnumWindows(Some(enum_callback), LPARAM(ptr as isize));
+        let mut collected: Vec<HWND> = Vec::new();
+        {
+            let ptr = &mut collected as *mut Vec<HWND>;
+            let _ = EnumWindows(Some(enum_callback), LPARAM(ptr as isize));
+        }
 
-        ws.retain(|h| {
-            if !IsWindow(*h).as_bool() {
-                return false;
+        for hwnd in collected {
+            if IsWindow(hwnd).as_bool() && Self::should_tile(hwnd) {
+                ws.push(WindowState { hwnd, prev_rect: None });
             }
-            Self::should_tile(*h)
-        });
+        }
     }
 
     unsafe fn remove_dead_windows(&mut self) {
         for ws in self.workspaces.values_mut() {
-            ws.retain(|h| IsWindow(*h).as_bool());
+            ws.retain(|w| IsWindow(w.hwnd).as_bool());
         }
         if let Some(focused) = self.focused {
             if !IsWindow(focused).as_bool() {
                 self.focused = None;
             }
+        }
+    }
+
+    fn hwnd_in_workspaces(&self, hwnd: HWND) -> bool {
+        for ws in self.workspaces.values() {
+            if ws.iter().any(|w| w.hwnd == hwnd) {
+                return true;
+            }
+        }
+        false
+    }
+
+    unsafe fn add_window(&mut self, hwnd: HWND) {
+        if !Self::should_tile(hwnd) {
+            return;
+        }
+        if self.hwnd_in_workspaces(hwnd) {
+            return;
+        }
+
+        if let Some(ws) = self.workspaces.get_mut(&self.current_workspace) {
+            ws.push(WindowState { hwnd, prev_rect: None });
+        }
+        self.tile_all();
+    }
+
+    unsafe fn remove_window(&mut self, hwnd: HWND) {
+        let mut removed = false;
+        for ws in self.workspaces.values_mut() {
+            let len_before = ws.len();
+            ws.retain(|w| w.hwnd != hwnd);
+            if ws.len() < len_before {
+                removed = true;
+            }
+        }
+        if removed {
+            if self.focused == Some(hwnd) {
+                self.focused = None;
+            }
+            self.tile_all();
         }
     }
 
@@ -262,12 +329,12 @@ impl WindowManager {
             Layout::Vertical => layout::compute_vertical(ws, &monitor, self.config.gaps, self.config.inner_gap),
         };
 
-        for (i, hwnd) in ws.iter().enumerate() {
+        for (i, state) in ws.iter().enumerate() {
             if let Some(rect) = rects.get(i) {
                 let w = rect.w.max(1);
                 let h = rect.h.max(1);
                 let _ = SetWindowPos(
-                    *hwnd,
+                    state.hwnd,
                     HWND_TOP,
                     rect.x, rect.y, w, h,
                     SWP_NOACTIVATE,
@@ -308,9 +375,9 @@ impl WindowManager {
             _ => return,
         };
 
-        let current_idx = ws.iter().position(|h| Some(*h) == self.focused).unwrap_or(0);
+        let current_idx = ws.iter().position(|w| Some(w.hwnd) == self.focused).unwrap_or(0);
         let next_idx = (current_idx + 1) % ws.len();
-        let next = ws[next_idx];
+        let next = ws[next_idx].hwnd;
         self.focus_window(next);
     }
 
@@ -321,9 +388,9 @@ impl WindowManager {
             _ => return,
         };
 
-        let current_idx = ws.iter().position(|h| Some(*h) == self.focused).unwrap_or(0);
+        let current_idx = ws.iter().position(|w| Some(w.hwnd) == self.focused).unwrap_or(0);
         let prev_idx = if current_idx == 0 { ws.len() - 1 } else { current_idx - 1 };
-        let prev = ws[prev_idx];
+        let prev = ws[prev_idx].hwnd;
         self.focus_window(prev);
     }
 
@@ -339,18 +406,36 @@ impl WindowManager {
             _ => return,
         };
 
-        let current_idx = ws.iter().position(|h| Some(*h) == self.focused).unwrap_or(0);
+        let current_idx = ws.iter().position(|w| Some(w.hwnd) == self.focused).unwrap_or(0);
         let next_idx = (current_idx + 1) % ws.len();
         ws.swap(current_idx, next_idx);
-        self.tile_all();
+        if self.tiling_enabled {
+            self.tile_all();
+        }
     }
 
-    unsafe fn toggle_fullscreen(&self) {
+    unsafe fn toggle_fullscreen(&mut self) {
         if let Some(hwnd) = self.focused {
             let style = GetWindowLongW(hwnd, GWL_STYLE);
             let has_caption = (style & WS_CAPTION.0 as i32) != 0;
 
             if has_caption {
+                let mut window_rect = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut window_rect);
+
+                let saved = Rect {
+                    x: window_rect.left,
+                    y: window_rect.top,
+                    w: window_rect.right - window_rect.left,
+                    h: window_rect.bottom - window_rect.top,
+                };
+
+                if let Some(ws) = self.workspaces.get_mut(&self.current_workspace) {
+                    if let Some(state) = ws.iter_mut().find(|w| w.hwnd == hwnd) {
+                        state.prev_rect = Some(saved);
+                    }
+                }
+
                 let new_style = style & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32);
                 SetWindowLongW(hwnd, GWL_STYLE, new_style);
 
@@ -364,12 +449,32 @@ impl WindowManager {
             } else {
                 let new_style = style | WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32;
                 SetWindowLongW(hwnd, GWL_STYLE, new_style);
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND_TOP,
-                    0, 0, 0, 0,
-                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE,
-                );
+
+                let restored = self.workspaces.get(&self.current_workspace)
+                    .and_then(|ws| ws.iter().find(|w| w.hwnd == hwnd))
+                    .and_then(|w| w.prev_rect);
+
+                if let Some(prev) = restored {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        prev.x, prev.y, prev.w, prev.h,
+                        SWP_FRAMECHANGED,
+                    );
+                } else {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        0, 0, 0, 0,
+                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE,
+                    );
+                }
+
+                if let Some(ws) = self.workspaces.get_mut(&self.current_workspace) {
+                    if let Some(state) = ws.iter_mut().find(|w| w.hwnd == hwnd) {
+                        state.prev_rect = None;
+                    }
+                }
             }
         }
     }
@@ -402,8 +507,8 @@ impl WindowManager {
 
         unsafe {
             if let Some(ws) = self.workspaces.get(&self.current_workspace) {
-                for hwnd in ws {
-                    let _ = ShowWindow(*hwnd, SW_HIDE);
+                for state in ws {
+                    let _ = ShowWindow(state.hwnd, SW_HIDE);
                 }
             }
         }
@@ -412,8 +517,8 @@ impl WindowManager {
 
         unsafe {
             if let Some(ws) = self.workspaces.get(&self.current_workspace) {
-                for hwnd in ws {
-                    let _ = ShowWindow(*hwnd, SW_SHOW);
+                for state in ws {
+                    let _ = ShowWindow(state.hwnd, SW_SHOW);
                 }
             }
             self.tile_all();
@@ -442,4 +547,32 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         ws.push(hwnd);
     }
     TRUE
+}
+
+unsafe extern "system" fn win_event_callback(
+    _hwin_event_hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    if hwnd.0.is_null() {
+        return;
+    }
+
+    if let Some(ptr) = GLOBAL_WM {
+        match event {
+            EVENT_OBJECT_CREATE => {
+                if WindowManager::should_tile(hwnd) && !(*ptr).hwnd_in_workspaces(hwnd) {
+                    (*ptr).add_window(hwnd);
+                }
+            }
+            EVENT_OBJECT_DESTROY => {
+                (*ptr).remove_window(hwnd);
+            }
+            _ => {}
+        }
+    }
 }

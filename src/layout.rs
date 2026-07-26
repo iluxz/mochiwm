@@ -1,6 +1,12 @@
 use windows::Win32::Foundation::HWND;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub struct WindowState {
+    pub hwnd: HWND,
+    pub prev_rect: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -24,7 +30,7 @@ fn clamp(val: i32, min: i32) -> i32 {
     val.max(min)
 }
 
-pub fn compute_master_stack(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
+pub fn compute_master_stack(windows: &[WindowState], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
     if windows.is_empty() {
         return vec![];
     }
@@ -67,7 +73,7 @@ pub fn compute_master_stack(windows: &[HWND], monitor: &Rect, gaps: i32, inner_g
     result
 }
 
-pub fn compute_grid(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
+pub fn compute_grid(windows: &[WindowState], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
     if windows.is_empty() {
         return vec![];
     }
@@ -90,7 +96,7 @@ pub fn compute_grid(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: i32)
     }).collect()
 }
 
-pub fn compute_horizontal(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
+pub fn compute_horizontal(windows: &[WindowState], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
     if windows.is_empty() {
         return vec![];
     }
@@ -108,7 +114,7 @@ pub fn compute_horizontal(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap
     }).collect()
 }
 
-pub fn compute_vertical(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
+pub fn compute_vertical(windows: &[WindowState], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
     if windows.is_empty() {
         return vec![];
     }
