@@ -1,0 +1,19 @@
+# mochiwm config
+
+gaps = 10
+border = 2
+inner_gap = 8
+animation_ms = 150
+
+[keybinds]
+modifier = "alt"
+tile_toggle = "t"
+kill = "q"
+focus_next = "j"
+focus_prev = "k"
+swap_next = "l"
+fullscreen = "f"
+launch_terminal = "return"
+
+[workspace]
+count = 9
