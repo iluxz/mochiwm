@@ -20,6 +20,10 @@ impl Default for Layout {
     fn default() -> Self { Self::MasterStack }
 }
 
+fn clamp(val: i32, min: i32) -> i32 {
+    val.max(min)
+}
+
 pub fn compute_master_stack(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: i32) -> Vec<Rect> {
     if windows.is_empty() {
         return vec![];
@@ -32,8 +36,8 @@ pub fn compute_master_stack(windows: &[HWND], monitor: &Rect, gaps: i32, inner_g
         return vec![Rect {
             x: m.x + gaps,
             y: m.y + gaps,
-            w: m.w - gaps * 2,
-            h: m.h - gaps * 2,
+            w: clamp(m.w - gaps * 2, 1),
+            h: clamp(m.h - gaps * 2, 1),
         }];
     }
 
@@ -47,16 +51,16 @@ pub fn compute_master_stack(windows: &[HWND], monitor: &Rect, gaps: i32, inner_g
     result.push(Rect {
         x: m.x + gaps,
         y: m.y + gaps,
-        w: master_w - gaps - inner_gap / 2,
-        h: m.h - gaps * 2,
+        w: clamp(master_w - gaps - inner_gap / 2, 1),
+        h: clamp(m.h - gaps * 2, 1),
     });
 
     for i in 0..stack_count {
         result.push(Rect {
             x: m.x + master_w + inner_gap / 2,
             y: m.y + gaps + i as i32 * stack_h + if i > 0 { inner_gap / 2 } else { 0 },
-            w: stack_w - gaps - inner_gap / 2,
-            h: stack_h - inner_gap,
+            w: clamp(stack_w - gaps - inner_gap / 2, 1),
+            h: clamp(stack_h - inner_gap, 1),
         });
     }
 
@@ -71,8 +75,8 @@ pub fn compute_grid(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: i32)
     let count = windows.len();
     let cols = (count as f32).sqrt().ceil() as i32;
     let rows = ((count as f32) / cols as f32).ceil() as i32;
-    let cell_w = (monitor.w - gaps * 2 - inner_gap * (cols - 1)) / cols;
-    let cell_h = (monitor.h - gaps * 2 - inner_gap * (rows - 1)) / rows;
+    let cell_w = clamp((monitor.w - gaps * 2 - inner_gap * (cols - 1)) / cols, 1);
+    let cell_h = clamp((monitor.h - gaps * 2 - inner_gap * (rows - 1)) / rows, 1);
 
     windows.iter().enumerate().map(|(i, _)| {
         let col = i as i32 % cols;
@@ -92,13 +96,13 @@ pub fn compute_horizontal(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap
     }
 
     let count = windows.len();
-    let strip_h = (monitor.h - gaps * 2 - inner_gap * (count as i32 - 1)) / count as i32;
+    let strip_h = clamp((monitor.h - gaps * 2 - inner_gap * (count as i32 - 1)) / count as i32, 1);
 
     windows.iter().enumerate().map(|(i, _)| {
         Rect {
             x: monitor.x + gaps,
             y: monitor.y + gaps + i as i32 * (strip_h + inner_gap),
-            w: monitor.w - gaps * 2,
+            w: clamp(monitor.w - gaps * 2, 1),
             h: strip_h,
         }
     }).collect()
@@ -110,14 +114,14 @@ pub fn compute_vertical(windows: &[HWND], monitor: &Rect, gaps: i32, inner_gap: 
     }
 
     let count = windows.len();
-    let col_w = (monitor.w - gaps * 2 - inner_gap * (count as i32 - 1)) / count as i32;
+    let col_w = clamp((monitor.w - gaps * 2 - inner_gap * (count as i32 - 1)) / count as i32, 1);
 
     windows.iter().enumerate().map(|(i, _)| {
         Rect {
             x: monitor.x + gaps + i as i32 * (col_w + inner_gap),
             y: monitor.y + gaps,
             w: col_w,
-            h: monitor.h - gaps * 2,
+            h: clamp(monitor.h - gaps * 2, 1),
         }
     }).collect()
 }
