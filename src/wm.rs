@@ -36,7 +36,10 @@ impl WindowManager {
 
     pub fn run(&mut self) {
         unsafe {
-            let instance = GetModuleHandleW(None).unwrap();
+            let instance = match GetModuleHandleW(None) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
             let class_name = w!("MochiWMClass");
 
             let wc = WNDCLASSEXW {
@@ -48,29 +51,41 @@ impl WindowManager {
                 ..std::mem::zeroed()
             };
 
-            RegisterClassExW(&wc);
+            if RegisterClassExW(&wc) == 0 {
+                return;
+            }
 
-            let hwnd = CreateWindowExW(
+            let hwnd = match CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
                 class_name,
                 w!("MochiWM"),
                 WS_OVERLAPPEDWINDOW,
                 0, 0, 0, 0,
                 None, None, instance, None,
-            ).unwrap();
+            ) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
 
-            SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA).ok();
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA);
 
             self.register_hotkeys(hwnd);
             self.collect_windows();
             self.tile_all();
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).into() {
+            loop {
+                let result = GetMessageW(&mut msg, None, 0, 0);
+                if result.0 == 0 {
+                    break;
+                }
+                if result.0 == -1 {
+                    break;
+                }
                 if msg.message == WM_HOTKEY {
                     self.handle_hotkey(msg.wParam.0 as u32);
                 }
-                TranslateMessage(&msg);
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
@@ -126,12 +141,12 @@ impl WindowManager {
         for (key, id) in binds {
             let vk = key_to_val(key);
             if vk != 0 {
-                RegisterHotKey(hwnd, id as i32, modif, vk);
+                let _ = RegisterHotKey(hwnd, id as i32, modif, vk);
             }
         }
 
         for ws in 1..=self.config.workspace.count {
-            RegisterHotKey(hwnd, 100 + ws as i32, modif, VK_1.0 as u32 + ws - 1);
+            let _ = RegisterHotKey(hwnd, 100 + ws as i32, modif, VK_1.0 as u32 + ws - 1);
         }
     }
 
@@ -146,7 +161,7 @@ impl WindowManager {
             7 => self.launch_terminal(),
             100..=109 => {
                 let ws = id - 100;
-                if ws <= self.config.workspace.count {
+                if ws >= 1 && ws <= self.config.workspace.count {
                     self.switch_workspace(ws);
                 }
             }
@@ -159,17 +174,35 @@ impl WindowManager {
         ws.clear();
 
         let ptr = LPARAM(ws as *mut Vec<HWND> as isize);
-        EnumWindows(Some(enum_callback), ptr).ok();
+        let _ = EnumWindows(Some(enum_callback), ptr);
 
         ws.retain(|h| {
+            if !IsWindow(*h).as_bool() {
+                return false;
+            }
+
             let style = GetWindowLongW(*h, GWL_STYLE);
             let ex_style = GetWindowLongW(*h, GWL_EXSTYLE);
+
             let visible = (style & WS_VISIBLE.0 as i32) != 0;
             let is_tool = (ex_style & WS_EX_TOOLWINDOW.0 as i32) != 0;
             let has_caption = (style & WS_CAPTION.0 as i32) != 0;
             let is_child = (style & WS_CHILD.0 as i32) != 0;
-            visible && !is_tool && !is_child && has_caption
+            let is_appwindow = (ex_style & WS_EX_APPWINDOW.0 as i32) != 0;
+
+            visible && !is_tool && !is_child && (has_caption || is_appwindow)
         });
+    }
+
+    unsafe fn remove_dead_windows(&mut self) {
+        for ws in self.workspaces.values_mut() {
+            ws.retain(|h| IsWindow(*h).as_bool());
+        }
+        if let Some(focused) = self.focused {
+            if !IsWindow(focused).as_bool() {
+                self.focused = None;
+            }
+        }
     }
 
     unsafe fn tile_all(&self) {
@@ -192,12 +225,12 @@ impl WindowManager {
 
         for (i, hwnd) in ws.iter().enumerate() {
             if let Some(rect) = rects.get(i) {
-                SetWindowPos(
+                let _ = SetWindowPos(
                     *hwnd,
-                    HWND_TOPMOST,
+                    HWND_TOP,
                     rect.x, rect.y, rect.w, rect.h,
                     SWP_NOACTIVATE,
-                ).ok();
+                );
             }
         }
     }
@@ -209,22 +242,26 @@ impl WindowManager {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..std::mem::zeroed()
         };
-        GetMonitorInfoW(monitor, &mut info);
+        let _ = GetMonitorInfoW(monitor, &mut info);
         let r = info.rcMonitor;
         Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }
     }
 
     fn toggle_tiling(&mut self) {
         self.tiling_enabled = !self.tiling_enabled;
+        if self.tiling_enabled {
+            unsafe { self.tile_all(); }
+        }
     }
 
     unsafe fn kill_focused(&self) {
         if let Some(hwnd) = self.focused {
-            PostMessageW(hwnd, WM_CLOSE, None, None).ok();
+            let _ = PostMessageW(hwnd, WM_CLOSE, None, None);
         }
     }
 
     unsafe fn focus_next(&mut self) {
+        self.remove_dead_windows();
         let ws = match self.workspaces.get(&self.current_workspace) {
             Some(w) if w.len() > 1 => w,
             _ => return,
@@ -236,6 +273,7 @@ impl WindowManager {
     }
 
     unsafe fn focus_prev(&mut self) {
+        self.remove_dead_windows();
         let ws = match self.workspaces.get(&self.current_workspace) {
             Some(w) if w.len() > 1 => w,
             _ => return,
@@ -247,11 +285,12 @@ impl WindowManager {
     }
 
     unsafe fn focus_window(&mut self, hwnd: HWND) {
-        SetForegroundWindow(hwnd).ok();
+        let _ = SetForegroundWindow(hwnd);
         self.focused = Some(hwnd);
     }
 
     unsafe fn swap_next(&mut self) {
+        self.remove_dead_windows();
         let ws = match self.workspaces.get_mut(&self.current_workspace) {
             Some(w) if w.len() > 1 => w,
             _ => return,
@@ -266,32 +305,42 @@ impl WindowManager {
     unsafe fn toggle_fullscreen(&self) {
         if let Some(hwnd) = self.focused {
             let style = GetWindowLongW(hwnd, GWL_STYLE);
-            let is_fullscreen = (style & WS_POPUP.0 as i32) != 0;
+            let has_caption = (style & WS_CAPTION.0 as i32) != 0;
 
-            if is_fullscreen {
-                let new_style = (style | WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32) as u32;
-                SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+            if has_caption {
+                let new_style = style & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32);
+                SetWindowLongW(hwnd, GWL_STYLE, new_style);
+
+                let monitor = self.get_monitor_rect();
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    monitor.x, monitor.y, monitor.w, monitor.h,
+                    SWP_FRAMECHANGED,
+                );
             } else {
-                let new_style = (style & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32)) as u32;
-                SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+                let new_style = style | WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32;
+                SetWindowLongW(hwnd, GWL_STYLE, new_style);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    0, 0, 0, 0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE,
+                );
             }
-
-            let monitor = self.get_monitor_rect();
-            SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                monitor.x, monitor.y, monitor.w, monitor.h,
-                SWP_FRAMECHANGED,
-            ).ok();
         }
     }
 
     unsafe fn launch_terminal(&self) {
-        use windows::Win32::System::Threading::{CreateProcessW, STARTUPINFOW};
+        use windows::Win32::System::Threading::CreateProcessW;
+        use windows::Win32::System::Threading::STARTUPINFOW;
+
+        let app = w!("pwsh.exe");
+        let mut cmd = [0u16; 2];
 
         let _ = CreateProcessW(
-            w!("pwsh.exe"),
-            PWSTR::null(),
+            app,
+            PWSTR(cmd.as_mut_ptr()),
             None,
             None,
             false,
@@ -311,7 +360,7 @@ impl WindowManager {
         unsafe {
             if let Some(ws) = self.workspaces.get(&self.current_workspace) {
                 for hwnd in ws {
-                    ShowWindow(*hwnd, SW_HIDE);
+                    let _ = ShowWindow(*hwnd, SW_HIDE);
                 }
             }
         }
@@ -321,7 +370,7 @@ impl WindowManager {
         unsafe {
             if let Some(ws) = self.workspaces.get(&self.current_workspace) {
                 for hwnd in ws {
-                    ShowWindow(*hwnd, SW_SHOW);
+                    let _ = ShowWindow(*hwnd, SW_SHOW);
                 }
             }
             self.tile_all();
@@ -345,7 +394,22 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let ws = &mut *(lparam.0 as *mut Vec<HWND>);
-    ws.push(hwnd);
+    if !IsWindowVisible(hwnd).as_bool() {
+        return TRUE;
+    }
+
+    let style = GetWindowLongW(hwnd, GWL_STYLE);
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+
+    let is_child = (style & WS_CHILD.0 as i32) != 0;
+    let is_tool = (ex_style & WS_EX_TOOLWINDOW.0 as i32) != 0;
+    let has_caption = (style & WS_CAPTION.0 as i32) != 0;
+    let is_appwindow = (ex_style & WS_EX_APPWINDOW.0 as i32) != 0;
+
+    if !is_child && !is_tool && (has_caption || is_appwindow) {
+        let ws = &mut *(lparam.0 as *mut Vec<HWND>);
+        ws.push(hwnd);
+    }
+
     TRUE
 }
